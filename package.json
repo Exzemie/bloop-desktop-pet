@@ -1,0 +1,86 @@
+{
+  "name": "bloop-desktop-pet",
+  "version": "3.10.3",
+  "description": "Bloop desktop pet with local AI, web search, isolated browser automation, permissioned computer control, and safety boundaries",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
+    "dist:linux": "electron-builder --linux"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^45.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "optionalDependencies": {
+    "uiohook-napi": "^1.5.5",
+    "electron-updater": "^6.3.9"
+  },
+  "author": "Exzemie",
+  "keywords": [
+    "desktop-pet",
+    "electron",
+    "ollama",
+    "local-ai",
+    "pixel-art"
+  ],
+  "bloop": {
+    "updateRepo": "Exzemie/bloop-desktop-pet"
+  },
+  "build": {
+    "appId": "com.bloop.desktoppet",
+    "productName": "Bloop",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "**/*",
+      "!.github/**",
+      "!dist/**",
+      "!*.vbs"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.utilities"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Utility"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Exzemie",
+        "repo": "bloop-desktop-pet",
+        "releaseType": "release"
+      }
+    ],
+    "npmRebuild": false,
+    "asarUnpack": [
+      "node_modules/uiohook-napi/**"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Exzemie/bloop-desktop-pet.git"
+  },
+  "homepage": "https://github.com/Exzemie/bloop-desktop-pet#readme",
+  "bugs": {
+    "url": "https://github.com/Exzemie/bloop-desktop-pet/issues"
+  }
+}

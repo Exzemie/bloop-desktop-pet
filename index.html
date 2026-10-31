@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'self' 'unsafe-inline'; script-src 'self'; img-src 'self' data:" />
+  <title>Bloop</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="stage">
+
+    <section id="chat" class="hit hidden">
+      <div class="chat-rz hit" data-dx="0" data-dy="1" id="rz-t" title="Drag to resize"></div>
+      <div class="chat-rz hit" data-dx="1" data-dy="0" id="rz-r" title="Drag to resize"></div>
+      <div class="chat-rz hit" data-dx="1" data-dy="1" id="rz-tr" title="Drag to resize"></div>
+      <header id="chat-head">
+        <span class="idx">01 / CHAT</span>
+        <span id="status-dot"></span>
+        <span id="status-text">Checking AI…</span>
+        <select id="model-select" class="hidden" title="AI model"></select>
+        <button id="chat-gear" title="Settings">SET</button>
+        <button id="chat-close" title="Close (Esc)">×</button>
+      </header>
+      <section id="settings" class="hidden"><div id="settings-body"></div></section>
+      <div id="messages"></div>
+      <form id="chat-form" autocomplete="off">
+        <textarea id="chat-input" rows="1" placeholder="Type a message or /help  (Shift+Enter for a new line)" maxlength="8000"></textarea>
+        <button id="send" type="submit" title="Send">↑</button>
+      </form>
+    </section>
+
+    <div id="pin" class="hit hidden"></div>
+    <div id="bubble" class="hit hidden"></div>
+    <div id="vis" class="hidden">
+      <div id="vis-grip" class="hit" title="Drag to resize"></div>
+      <div id="vis-left">
+        <div id="vis-transport">
+          <div id="vis-title">Now playing</div>
+          <div id="vis-ctl">
+            <button id="m-prev" title="Previous / rewind"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M6 6h2v12H6zM9.5 12L18 6v12z"/></svg></button>
+            <button id="m-play" title="Play / pause"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M6 5h4v14H6zM14 5h4v14h-4z"/></svg></button>
+            <button id="m-next" title="Next"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M16 6h2v12h-2zM6 6l8.5 6L6 18z"/></svg></button>
+          </div>
+        </div>
+        <div id="vis-timebar"><span id="m-pos">0:00</span><input id="m-seek" type="range" min="0" max="1000" value="0" title="Seek"><span id="m-dur">0:00</span></div>
+      </div>
+      <div id="vis-right">
+        <canvas id="vis-canvas" width="100" height="50"></canvas>
+        <span id="vis-bpm"></span>
+        <div id="vis-volume"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M4 9v6h4l5 4V5L8 9z"/></svg><input id="m-vol" type="range" min="0" max="100" value="50" title="Volume"></div>
+      </div>
+    </div>
+    <div id="pomo" class="hidden"><span id="pomo-phase"></span><b id="pomo-time"></b></div>
+
+    <div id="pet-wrap" class="hit">
+      <svg id="pet" class="s-idle" viewBox="-1 -5 26 29" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+
+  </div>
+  <script src="fx.js"></script>
+  <script src="smooth.js"></script>
+  <script src="cat.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>
