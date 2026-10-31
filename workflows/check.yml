@@ -1,0 +1,13 @@
+name: check
+on: [push, pull_request]
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Syntax-check every script
+        run: for f in *.js; do node --check "$f"; done
+      - name: Smoke-test the renderers
+        run: node -e "const C=require('./cat.js');for(const r of ['smooth','pixel','dots'])for(const s of C.STYLES)C.markup({style:s,render:r,fur:'white',pattern:'solid'});console.log('ok')"
