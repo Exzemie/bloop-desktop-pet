@@ -269,14 +269,14 @@ installed app: downloads and restarts itself; git clone: `git pull` + `npm insta
 Bloop also mentions a new version once a day at most (turn off in Settings). Only the latest release number is fetched.
 
 **Maintainers:** set `"bloop": { "updateRepo": "owner/repo" }` in `package.json`. To publish, bump `version`, commit, then
-`git tag v3.10.1 \&\& git push --tags`; the *release* workflow builds the installers and attaches them to a GitHub Release.
+`git tag v3.10.3 \&\& git push --tags`; the *release* workflow builds the installers and attaches them to a GitHub Release.
 
 
 
 ### Run it like a normal app (no terminal)
 
 * **Build an installer on your own PC:** run `npm install` once, then `npm run dist:win` (macOS: `dist:mac`, Linux: `dist:linux`).
-The installer appears in the `dist` folder (for example `Bloop Setup 3.10.1.exe`). Double-click it: Bloop installs, gets a Start menu entry, and can start with Windows (Settings > Start at login).
+The installer appears in the `dist` folder (for example `Bloop Setup 3.10.3.exe`). Double-click it: Bloop installs, gets a Start menu entry, and can start with Windows (Settings > Start at login).
 On Windows, if the build stops with "Cannot create symbolic link", turn on *Developer Mode* (Settings > For developers) or run the terminal as administrator once.
 * **Just double-click:** `Start Bloop.vbs` starts it from the source folder without a terminal window.
 * **Let GitHub build it:** push a tag (see Maintainers above) and download the installers from the Releases page.
