@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow, ipcMain, screen, Menu, shell, globalShortcut, Tray, nativeImage, powerMonitor, clipboard, desktopCapturer, session, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, Menu, shell, globalShortcut, Tray, nativeImage, powerMonitor, clipboard, desktopCapturer, session, dialog, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -8,7 +8,6 @@ const { spawn } = require('child_process');
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-const OLLAMA = 'http://127.0.0.1:11434'; // local, free, unlimited AI
 const AGENT_PORT = 47321; // local-only endpoint AI coding tools can ping (see README)
 const CAN_IGNORE_MOUSE = process.platform !== 'linux'; // click-through on transparent areas
 
@@ -16,7 +15,9 @@ if (process.platform === 'linux') {
   app.commandLine.appendSwitch('enable-transparent-visuals');
   app.commandLine.appendSwitch('disable-gpu');
 }
-if (!app.requestSingleInstanceLock()) app.quit();
+// Only one Bloop at a time. A second launch just shows the first one (see 'second-instance' below).
+const PRIMARY = app.requestSingleInstanceLock();
+if (!PRIMARY) app.quit();
 
 // The window scales with the cat (Settings > Size). Chat mode is a fixed size.
 let scale = 1;
@@ -39,19 +40,56 @@ let size = compactSize();
 let dragOrigin = null;
 let fallTimer = null;
 let peeking = false;
+let peekSide = 'right'; // which screen edge peek mode tucks into
 const aborts = new Map();
 
 // ---------------------------------------------------------------------------
 // Tiny JSON state store
 // ---------------------------------------------------------------------------
+// Saves are atomic (write a temp file, then rename it over the old one), so a crash or power cut in the
+// middle of a save can never leave a half-written file. A backup copy is refreshed every few minutes and
+// used if the main file is ever unreadable, so settings, to-dos, reminders and bond level survive.
 const statePath = () => path.join(app.getPath('userData'), 'state.json');
-function loadState() {
-  try { return JSON.parse(fs.readFileSync(statePath(), 'utf8')); } catch { return {}; }
-}
-function saveState(s) {
+const readJson = (file) => {
+  const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('not an object');
+  return j;
+};
+function writeJsonAtomic(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const text = JSON.stringify(data, null, 2);
+  const tmp = file + '.tmp';
   try {
-    fs.mkdirSync(path.dirname(statePath()), { recursive: true });
-    fs.writeFileSync(statePath(), JSON.stringify(s, null, 2));
+    fs.writeFileSync(tmp, text, 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    // e.g. antivirus briefly holding the file on Windows: fall back to a plain write
+    try { fs.unlinkSync(tmp); } catch { /* nothing to clean up */ }
+    fs.writeFileSync(file, text, 'utf8');
+  }
+}
+function loadState() {
+  const p = statePath();
+  try { return readJson(p); }
+  catch (e) {
+    if (e.code !== 'ENOENT') {
+      console.error('state.json is unreadable, trying the backup:', e.message);
+      try { fs.copyFileSync(p, p.replace(/\.json$/, '.corrupt.json')); } catch { /* best effort */ }
+    }
+  }
+  try { return readJson(p + '.bak'); } catch { return {}; }
+}
+const BACKUP_EVERY_MS = 10 * 60 * 1000;
+let lastBackup = 0;
+function saveState(s) {
+  if (!s || typeof s !== 'object' || Array.isArray(s)) return;
+  try {
+    const p = statePath();
+    if (Date.now() - lastBackup > BACKUP_EVERY_MS) {
+      try { readJson(p); fs.copyFileSync(p, p + '.bak'); } catch { /* nothing good to back up yet */ }
+      lastBackup = Date.now();
+    }
+    writeJsonAtomic(p, s);
   } catch (e) { console.error('save failed', e); }
 }
 
@@ -113,7 +151,11 @@ function createWindow() {
   win.on('blur', onFocusMoved);
   win.on('focus', () => keepOnTop());
   win.on('hide', () => {});
-  screen.on('display-metrics-changed', () => keepOnTop(true));
+  for (const ev of ['display-metrics-changed', 'display-added', 'display-removed']) screen.on(ev, () => onFocusMoved());
+  // waking up, unlocking or switching user reshuffles every window: take the top spot back afterwards
+  for (const ev of ['resume', 'unlock-screen', 'user-did-become-active']) powerMonitor.on(ev, () => onFocusMoved());
+  win.on('show', () => onFocusMoved());
+  win.on('restore', () => onFocusMoved());
   win.on('minimize', () => setTimeout(() => { if (win && !win.isDestroyed() && topWanted && win.isMinimized()) { win.restore(); keepOnTop(); } }, 50));
   if (CAN_IGNORE_MOUSE) win.setIgnoreMouseEvents(true, { forward: true });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -128,25 +170,29 @@ function createWindow() {
   });
 }
 
-// Clicking another window can push the pet underneath it (other apps also claim "topmost", and the
-// last one clicked wins). Re-assert our place whenever focus changes and every second, without stealing focus.
+// Staying on top. Other always-on-top windows (and Windows itself, e.g. Show Desktop) can push the pet
+// down or strip its "topmost" flag, and the last window to claim the top wins. So the claim is re-made a
+// few times a second and whenever focus, the displays or the session change, never stealing focus.
+//
+// Measured on Windows: calling setAlwaysOnTop(true, ...) again while it is already on DOES re-apply the
+// flag and move the pet back to the front. Earlier versions switched it off and on again instead; every
+// one of those toggles left the pet non-topmost for ~15 ms, right as another window was being raised,
+// which is how it ended up underneath. The flag is now never dropped.
 let topWanted = true;
-let topTick = 0;
-// Electron ignores setAlwaysOnTop(true) when it is already "on", so after another window grabs the top
-// spot we have to switch it off and on again to really win it back. "hard" does that.
-function keepOnTop(hard) {
+let menuOpen = false; // a right-click menu must stay above the pet, so hold off while one is showing
+const TOP_EVERY_MS = 300;
+function keepOnTop() {
   try {
-    if (!win || win.isDestroyed() || !topWanted || !win.isVisible()) return;
+    if (!win || win.isDestroyed() || !topWanted || menuOpen || !win.isVisible()) return;
     if (win.isMinimized()) win.restore();
-    if (hard === true) win.setAlwaysOnTop(false);
     win.setAlwaysOnTop(true, 'screen-saver', 1);
     win.moveTop();
   } catch { /* window closing */ }
 }
-const bringToFront = () => { if (win && !win.isDestroyed()) { if (!win.isVisible()) win.showInactive(); keepOnTop(true); } };
-// when focus moves to another window: win it back right away, then again once that window has settled
-function onFocusMoved() { keepOnTop(true); setTimeout(() => keepOnTop(true), 200); setTimeout(() => keepOnTop(true), 800); }
-setInterval(() => { topTick++; keepOnTop(topTick % 4 === 0); }, 700);
+const bringToFront = () => { if (win && !win.isDestroyed()) { if (!win.isVisible()) win.showInactive(); keepOnTop(); } };
+// when focus moves to another window: claim the top right away, then again once that window has settled
+function onFocusMoved() { keepOnTop(); for (const ms of [60, 200, 500, 1000]) setTimeout(keepOnTop, ms); }
+setInterval(keepOnTop, TOP_EVERY_MS);
 
 function showWin() { if (win && !win.isDestroyed()) { win.showInactive(); } }
 function toggleVisible() { if (win && win.isVisible()) win.hide(); else showWin(); }
@@ -156,15 +202,21 @@ function createTray() {
     const img = nativeImage.createFromPath(path.join(__dirname, 'assets', 'tray.png'));
     tray = new Tray(img);
     tray.setToolTip('Bloop');
-    tray.setContextMenu(Menu.buildFromTemplate([
-      { label: 'Show / hide Bloop', click: toggleVisible },
-      { label: 'Bring Bloop to front  (Ctrl/Cmd+Shift+B)', click: bringToFront },
-      { label: 'Settings…', click: () => { showWin(); if (win) win.webContents.send('menu:action', 'settings'); } },
-      { type: 'separator' },
-      { label: 'Quit Bloop', click: () => app.quit() },
-    ]));
+    buildTrayMenu();
     tray.on('click', toggleVisible);
   } catch (e) { console.error('tray unavailable:', e.message); }
+}
+// rebuilt whenever "Always on top" changes, so its tick mark is always right
+function buildTrayMenu() {
+  if (!tray) return;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Show / hide Bloop', click: toggleVisible },
+    { label: 'Bring Bloop to front  (Ctrl/Cmd+Shift+B)', click: bringToFront },
+    { label: 'Always on top', type: 'checkbox', checked: topWanted, click: () => { showWin(); if (win) win.webContents.send('menu:action', 'toggle-top'); } },
+    { label: 'Settings…', click: () => { showWin(); if (win) win.webContents.send('menu:action', 'settings'); } },
+    { type: 'separator' },
+    { label: 'Quit Bloop', click: () => app.quit() },
+  ]));
 }
 
 // ---------------------------------------------------------------------------
@@ -203,14 +255,16 @@ ipcMain.on('win:dragMove', (_e, sx, sy) => {
 ipcMain.on('win:dragEnd', () => { dragOrigin = null; startFall(); });
 
 // Peek mode: half the cat hangs off the right edge of the screen.
-ipcMain.on('win:peek', (_e, on) => {
+const peekX = (wa, w) => (peekSide === 'left' ? wa.x - Math.round(w / 2) : wa.x + wa.width - Math.round(w / 2));
+ipcMain.on('win:peek', (_e, on, side) => {
   if (!win) return;
+  if (side === 'left' || side === 'right') peekSide = side;
   stopFall();
   const wa = workArea();
   const floor = wa.y + wa.height - size.h;
   peeking = !!on;
-  if (on) setBoundsSafe(wa.x + wa.width - size.w / 2, floor);
-  else setBoundsSafe(wa.x + wa.width - size.w - 90, floor);
+  if (on) setBoundsSafe(peekX(wa, size.w), floor);
+  else setBoundsSafe(peekSide === 'left' ? wa.x + 90 : wa.x + wa.width - size.w - 90, floor);
 });
 
 ipcMain.on('win:mode', (_e, m) => {
@@ -256,7 +310,7 @@ function refreshCompact() {
   const wa = workArea();
   const m = sideMargin();
   let x = Math.round(cx - n.w / 2);
-  x = peeking ? wa.x + wa.width - Math.round(n.w / 2) : Math.max(wa.x - m, Math.min(x, wa.x + wa.width - n.w + m));
+  x = peeking ? peekX(wa, n.w) : Math.max(wa.x - m, Math.min(x, wa.x + wa.width - n.w + m));
   win.setResizable(true);
   win.setBounds({ x, y: Math.max(wa.y, bottom - n.h), width: n.w, height: n.h });
   win.setResizable(false);
@@ -272,7 +326,7 @@ const media = require('./media')({ send: (st) => { if (win && !win.isDestroyed()
 ipcMain.on('media:start', () => media.start());
 ipcMain.on('media:stop', () => media.stop());
 ipcMain.on('media:cmd', (_e, action, value) => media.cmd(String(action), value));
-ipcMain.on('win:alwaysOnTop', (_e, v) => { topWanted = !!v; if (win) win.setAlwaysOnTop(!!v, 'screen-saver'); if (v) keepOnTop(true); });
+ipcMain.on('win:alwaysOnTop', (_e, v) => { topWanted = !!v; if (win) win.setAlwaysOnTop(!!v, 'screen-saver'); if (v) keepOnTop(); buildTrayMenu(); });
 ipcMain.on('win:front', () => bringToFront());
 // ---- updates (/update): see updater.js
 const updater = require('./updater')({ app, shell, dialog, getWin: () => win, send: (ch, p) => { if (win && !win.isDestroyed()) win.webContents.send(ch, p); } });
@@ -288,6 +342,8 @@ ipcMain.handle('app:login:set', (_e, on) => {
 });
 // Only read when you explicitly ask (/clip or the menu item). Never polled.
 ipcMain.handle('clipboard:read', () => clipboard.readText() || '');
+// The Copy button on a code block in chat (a click by the user, text only). The AI's own clipboard tool still asks first.
+ipcMain.handle('clipboard:write', (_e, text) => { clipboard.writeText(String(text == null ? '' : text).slice(0, 200000)); return true; });
 
 ipcMain.on('win:ignore', (_e, v) => {
   if (CAN_IGNORE_MOUSE && win) win.setIgnoreMouseEvents(!!v, { forward: true });
@@ -315,6 +371,7 @@ ipcMain.on('win:menu', (_e, cfg) => {
     cfg.pomoRunning
       ? { label: 'Stop Pomodoro', click: send('pomo-stop') }
       : { label: 'Start Pomodoro (25 / 5)', click: send('pomo-start') },
+    { label: 'Always on top', type: 'checkbox', checked: s.alwaysOnTop !== false, click: send('toggle-top') },
     { label: 'Peek mode', type: 'checkbox', checked: !!s.peek, click: send('toggle-peek') },
     { label: 'Listen to music', type: 'checkbox', checked: !!s.listen,
       click: () => win.webContents.executeJavaScript('toggleListen()', true).catch(() => {}) },
@@ -331,6 +388,7 @@ ipcMain.on('win:menu', (_e, cfg) => {
       { label: 'Nothing', type: 'radio', checked: !(cfg.look && cfg.look.acc), click: send('acc:') },
       ...(cfg.accs || []).map((n) => ({ label: n[0].toUpperCase() + n.slice(1), type: 'radio', checked: n === (cfg.look && cfg.look.acc), click: send('acc:' + n) })),
     ] },
+    { label: 'AI brain', submenu: (cfg.providers || []).map((p) => ({ label: p.label + (p.local ? '' : '  (cloud)'), type: 'radio', checked: p.id === cfg.provider, click: send('provider:' + p.id) })) },
     { label: 'AI model', submenu: (cfg.models && cfg.models.length)
       ? cfg.models.map((n) => ({ label: n, type: 'radio', checked: n === cfg.model, click: send('model:' + n) }))
       : [{ label: 'No models installed (type /pull llama3.2:3b)', enabled: false }] },
@@ -350,7 +408,8 @@ ipcMain.on('win:menu', (_e, cfg) => {
     { type: 'separator' },
     { label: 'Quit Bloop', click: () => app.quit() },
   ]);
-  menu.popup({ window: win });
+  menuOpen = true;
+  menu.popup({ window: win, callback: () => { menuOpen = false; onFocusMoved(); } });
 });
 
 ipcMain.on('app:openSetup', () => shell.openExternal('https://ollama.com/download'));
@@ -404,31 +463,50 @@ ipcMain.handle('input:enable', (_e, on) => {
 // ---------------------------------------------------------------------------
 function startAgentServer() {
   const srv = http.createServer((req, res) => {
-    const p = (req.url || '').split('?')[0];
+    let p = '', agent = '';
+    try {
+      const u = new URL(req.url || '/', 'http://127.0.0.1');
+      p = u.pathname;
+      // optional ?agent=claude so Bloop can say which one finished. Letters and digits only, kept short.
+      agent = String(u.searchParams.get('agent') || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 24);
+    } catch { /* malformed request line: falls through to 404 */ }
+    // Browsers attach an Origin header to cross-site requests; curl and agent hooks do not.
+    // Refusing it keeps random web pages from poking the pet through this port.
+    if (req.headers.origin) { res.writeHead(403); return res.end(); }
+    req.resume();
     if (req.method === 'POST' && ['/working', '/done', '/idle'].includes(p)) {
-      if (win && !win.isDestroyed()) win.webContents.send('agent:status', p.slice(1));
+      if (win && !win.isDestroyed()) win.webContents.send('agent:status', p.slice(1), agent);
       res.writeHead(204);
       return res.end();
     }
     res.writeHead(404);
     res.end();
   });
-  srv.on('error', (e) => console.error('agent endpoint:', e.message));
+  srv.on('error', (e) => console.error('agent endpoint (port ' + AGENT_PORT + ' may be in use; coding-agent pings are off):', e.message));
   srv.listen(AGENT_PORT, '127.0.0.1');
 }
 
 // ---------------------------------------------------------------------------
 // IPC: AI (local Ollama, streaming)
 // ---------------------------------------------------------------------------
+// Which AI does the thinking: local Ollama / LM Studio, or a cloud provider with your API key (see providers.js).
+const providers = require('./providers')({ app, safeStorage, writeJsonAtomic });
 ipcMain.handle('ai:status', async () => {
-  try {
-    const r = await fetch(OLLAMA + '/api/tags', { signal: AbortSignal.timeout(2500) });
-    if (!r.ok) throw new Error('bad status');
-    const j = await r.json();
-    return { running: true, models: (j.models || []).map((m) => m.name) };
-  } catch {
-    return { running: false, models: [] };
-  }
+  try { return await providers.status(); } catch (e) { return { running: false, models: [], allModels: [], error: String(e.message || e) }; }
+});
+ipcMain.handle('ai:config:get', () => providers.publicConfig());
+ipcMain.handle('ai:config:set', (_e, patch) => {
+  try { return { ok: true, config: providers.setConfig(patch) }; } catch (e) { return { ok: false, error: String(e.message || e) }; }
+});
+ipcMain.handle('ai:key:set', (_e, pid, key) => providers.setKey(String(pid || ''), key));
+ipcMain.handle('ai:key:clear', (_e, pid) => providers.clearKey(String(pid || '')));
+ipcMain.handle('ai:key:page', (_e, pid) => {
+  const url = providers.keyPage(String(pid || ''));
+  if (url) shell.openExternal(url); // only the provider's own key page from the built-in list
+  return !!url;
+});
+ipcMain.handle('ai:models', async (_e, pid, force) => {
+  try { return { ok: true, ids: (await providers.listModels(pid || undefined, !!force)).ids }; } catch (e) { return { ok: false, ids: [], error: String(e.message || e) }; }
 });
 
 ipcMain.on('ai:abort', (_e, id) => { const c = aborts.get(id); if (c) c.abort(); });
@@ -444,10 +522,7 @@ function loadIntegrations() {
     appsMode: cfg.appsMode === 'whitelist' ? 'whitelist' : 'blacklist',
     blockedApps: Array.isArray(cfg.blockedApps) ? cfg.blockedApps : DEFAULT_BLOCKED_APPS };
 }
-function saveIntegrations(cfg) {
-  fs.mkdirSync(path.dirname(integrationPath()), { recursive: true });
-  fs.writeFileSync(integrationPath(), JSON.stringify(cfg, null, 2), 'utf8');
-}
+function saveIntegrations(cfg) { writeJsonAtomic(integrationPath(), cfg); }
 function inside(parent, target) {
   const rel = path.relative(path.resolve(parent), path.resolve(target));
   return rel === '' || (!rel.startsWith('..' + path.sep) && rel !== '..' && !path.isAbsolute(rel));
@@ -867,13 +942,15 @@ ipcMain.handle('apps:add', async () => {
 });
 
 const control = require('./control')({
-  dialog, screen, desktopCapturer, shell, clipboard, ollamaUrl: OLLAMA,
+  dialog, screen, desktopCapturer, shell, clipboard, ollamaUrl: providers.ollamaBase(), modelCaps: (m) => modelCaps(m),
   getWin: () => win, loadIntegrations, saveIntegrations,
 });
 control.register(ipcMain);
 ipcMain.handle('diag:run', async (_e, model) => {
   const out = [];
   const caps = await modelCaps(model);
+  const pid = providers.active();
+  out.push('AI: ' + providers.label(pid) + (providers.isCloud(pid) ? ' (cloud: your messages go to this provider)' : ' (on this computer)'));
   out.push('Model: ' + (model || '(none)') + (caps.known ? '' : ' (capabilities unknown)'));
   out.push('  can use tools: ' + (caps.tools ? 'yes' : 'NO - Bloop cannot take actions with this model') + '   can see images: ' + (caps.vision ? 'yes' : 'no'));
   const cfg = loadIntegrations();
@@ -885,9 +962,14 @@ ipcMain.handle('diag:run', async (_e, model) => {
   if (model) {
     const t0 = Date.now();
     try {
-      const r = await fetch(OLLAMA + '/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Say hi.' }], stream: false, think: false, options: { num_predict: 8, num_ctx: 8192 } }), signal: AbortSignal.timeout(150000) });
+      let reply = '';
+      for await (const obj of providers.stream({ model, messages: [{ role: 'user', content: 'Say hi in three words.' }], think: false, signal: AbortSignal.timeout(150000) })) {
+        if (obj.message && obj.message.content) reply += obj.message.content;
+        if (obj.done || reply.length > 60) break;
+      }
       const secs = ((Date.now() - t0) / 1000).toFixed(1);
-      out.push(r.ok ? 'Chat test: model answered in ' + secs + 's' + (secs > 20 ? ' (slow: use a smaller model such as llama3.2:3b or qwen3:1.7b on this PC)' : '') : 'Chat test FAILED: ' + (await r.text()).slice(0, 200));
+      out.push('Chat test: model answered in ' + secs + 's' + (reply.trim() ? ' ("' + reply.trim().slice(0, 40) + '")' : ' (empty reply)') +
+        (secs > 20 && !providers.isCloud(pid) ? ' (slow: use a smaller model such as llama3.2:3b or qwen3:1.7b on this PC)' : ''));
     } catch (err) { out.push('Chat test FAILED after ' + ((Date.now() - t0) / 1000).toFixed(0) + 's: ' + String((err && err.message) || err).slice(0, 150)); }
   }
   out.push(...await control.diagnose());
@@ -943,21 +1025,8 @@ function compactConversation(conv) {
 const STALL_MS = Number(process.env.BLOOP_STALL_MS) || 90000;
 const FIRST_MS = Number(process.env.BLOOP_FIRST_MS) || 180000;
 
-// What can this model do? (cached) -> { tools, vision, known }
-const capCache = new Map();
-async function modelCaps(model) {
-  if (capCache.has(model)) return capCache.get(model);
-  let caps = { tools: true, vision: true, thinking: false, known: false };
-  try {
-    const r = await fetch(OLLAMA + '/api/show', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model }), signal: AbortSignal.timeout(4000) });
-    if (r.ok) {
-      const j = await r.json();
-      if (Array.isArray(j.capabilities)) caps = { tools: j.capabilities.includes('tools'), vision: j.capabilities.includes('vision'), thinking: j.capabilities.includes('thinking'), known: true };
-    }
-  } catch { /* keep optimistic defaults */ }
-  capCache.set(model, caps);
-  return caps;
-}
+// What can this model do? -> { tools, vision, thinking, known } (providers.js knows each provider)
+async function modelCaps(model, pid) { return providers.caps(model, pid); }
 // Some small models print a tool call as JSON text instead of using the real tool channel.
 // Recover those so the action actually runs.
 function textToolCalls(text) {
@@ -998,7 +1067,9 @@ function selectTools(text, hadToolsRecently, taskMode) {
   return [...picked];
 }
 
-ipcMain.handle('ai:chat', async (e, { id, model, messages, think }) => {
+ipcMain.handle('ai:chat', async (e, { id, model, messages, think, provider }) => {
+  const pid = provider && providers.CATALOG.some((p) => p.id === provider) ? provider : providers.active();
+  const cloud = providers.isCloud(pid);
   const ctrl = new AbortController();
   aborts.set(id, ctrl);
   const sender = e.sender;
@@ -1007,14 +1078,21 @@ ipcMain.handle('ai:chat', async (e, { id, model, messages, think }) => {
   let truncated = false;
   const latestUserRequest = Array.isArray(messages) ? [...messages].reverse().find(m => m && m.role === 'user')?.content : '';
   const arm = (ms) => { clearTimeout(stall); stall = setTimeout(() => ctrl.abort('stalled'), ms); };
+  // The reply to this call can reach the window before the last few token messages do (they travel on a
+  // different IPC pipe), so the reply says how many were sent and the window waits for all of them.
+  let sentTokens = 0;
   const sendToken = (token) => {
     total += token.length;
+    sentTokens++;
     if (!sender.isDestroyed()) sender.send('ai:token', { id, token });
   };
   let toolsRun = 0, nudges = 0, emptyRetries = 0, parseRetries = 0;
   try {
-    let conversation = Array.isArray(messages) ? messages.slice(-20) : [];
-    const caps = await modelCaps(model);
+    // keep the system prompt plus the most recent turns (Settings > AI > Memory decides how many are sent)
+    const all = Array.isArray(messages) ? messages.filter(Boolean) : [];
+    const sys = all[0] && all[0].role === 'system' ? [all[0]] : [];
+    let conversation = [...sys, ...all.slice(sys.length).slice(-60)];
+    const caps = await modelCaps(model, pid);
     const wantsAction = ACTION_REQUEST.test(String(latestUserRequest || ''));
     const recentTools = Array.isArray(messages) && messages.slice(-4).some((m) => m && m.role === 'assistant' && /\[Bloop \//.test(String(m.content || '')));
     const pol = control.getPolicy();
@@ -1030,34 +1108,20 @@ ipcMain.handle('ai:chat', async (e, { id, model, messages, think }) => {
     let noThink = true; // send an explicit think flag (false = fast, true = show reasoning)
     const wantThink = !!think && caps.thinking;
     if (think && !caps.thinking && caps.known && !sender.isDestroyed()) sender.send('ai:thinking', { id, token: '(this model has no reasoning mode. Try qwen3 or deepseek-r1.)' });
-    if (!useTools && wantsAction) sendToken('(Heads up: "' + model + '" cannot use tools, so I cannot actually do things on your computer with it. Try /pull qwen3:4b or llama3.1:8b, then /model.)\n\n');
+    if (!useTools && wantsAction) sendToken('(Heads up: "' + model + '" cannot use tools, so I cannot actually do things on your computer with it. ' + (cloud ? 'Pick a model that supports tools with /model.' : 'Try /pull qwen3:4b or llama3.1:8b, then /model.') + ')\n\n');
+    let lastRaw = null;
     // Bounded tool rounds per user request (computer control needs look-act-look loops).
     for (let round = 0; round < maxRounds; round++) {
-      compactConversation(conversation);
+      // Local models have small context windows, so old steps get squeezed; cloud models have room to spare.
+      if (!cloud) compactConversation(conversation);
+      const over = providers.checkLimit(pid);
+      if (over) { sendToken((total ? '\n\n' : '') + over); break; }
       arm(FIRST_MS);
       try {
-      const res = await fetch(OLLAMA + '/api/chat', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages: conversation, ...(useTools ? { tools: toolSet } : {}), stream: true, ...(noThink ? { think: wantThink } : {}), keep_alive: '30m',
-          options: { num_predict: -1, temperature: 0.4, repeat_penalty: 1.15, num_ctx: 8192 } }), signal: ctrl.signal,
-      });
-      if (!res.ok) throw new Error((await res.text()) || 'HTTP ' + res.status);
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '', content = '', held = '', holding = false, assistantMessage = null, finalObj = null;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        arm(STALL_MS);
-        buf += dec.decode(value, { stream: true });
-        let nl;
-        while ((nl = buf.indexOf('\n')) >= 0) {
-          const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
-          if (!line) continue;
-          let obj;
-          try { obj = JSON.parse(line); } catch { continue; }
-          if (obj.error) throw new Error(obj.error);
-          finalObj = obj;
+      let content = '', held = '', holding = false, assistantMessage = null;
+      for await (const obj of providers.stream({ provider: pid, model, messages: conversation, tools: useTools ? toolSet : null, think: noThink ? wantThink : undefined, wantThink, signal: ctrl.signal })) {
+          arm(STALL_MS);
+          if (obj.raw) lastRaw = obj.raw;
           if (obj.message) {
             if (obj.message.thinking && wantThink && !sender.isDestroyed()) sender.send('ai:thinking', { id, token: obj.message.thinking });
             if (obj.message.content) {
@@ -1069,9 +1133,7 @@ ipcMain.handle('ai:chat', async (e, { id, model, messages, think }) => {
               assistantMessage = obj.message;
             }
           }
-          if (obj.done) break;
-        }
-        if (assistantMessage) { try { await reader.cancel(); } catch {} break; }
+          if (assistantMessage || obj.done) break;
       }
       // Empty reply (common with small or "thinking" models): try once more instead of failing.
       if (!assistantMessage && !holding && !content.trim() && emptyRetries < 1 && !ctrl.signal.aborted) {
@@ -1086,7 +1148,7 @@ ipcMain.handle('ai:chat', async (e, { id, model, messages, think }) => {
       }
       if (assistantMessage && Array.isArray(assistantMessage.tool_calls) && assistantMessage.tool_calls.length) {
         toolsRun += assistantMessage.tool_calls.length;
-        conversation.push({ role: 'assistant', content, tool_calls: assistantMessage.tool_calls });
+        conversation.push({ role: 'assistant', content, tool_calls: assistantMessage.tool_calls, ...(assistantMessage._raw ? { _raw: assistantMessage._raw } : {}) });
         let screenshot = null;
         for (const call of assistantMessage.tool_calls.slice(0, 4)) {
           const fn = call.function || {};
@@ -1096,10 +1158,15 @@ ipcMain.handle('ai:chat', async (e, { id, model, messages, think }) => {
           sendToken('\n\n[Bloop / ' + (toolName || 'action') + '…]\n');
           let result;
           try {
-            if (control.isControlTool(toolName)) {
+            if (call.invalid) result = 'Error: the input for this action was cut off or was not valid JSON, so it was not run. Call it again with complete arguments.';
+            else if (control.isControlTool(toolName)) {
               const r = await control.runTool(toolName, args, { model, task });
               result = r.text;
-              if (r.image) screenshot = r.image;
+              if (r.image) {
+                // a cloud AI only sees the screen if the user allowed it (Settings > AI)
+                if (cloud && !providers.load().cloudVision) result = 'Screenshot NOT sent: the user has not allowed cloud AI to see their screen. Do not guess what is on screen. Tell the user they can allow it in Settings > AI > "Let cloud AI see screenshots", or work with keyboard shortcuts, launch_app and open_path instead.';
+                else screenshot = r.image;
+              }
             } else result = await runBloopTool(toolName, { ...args, userRequest: String(latestUserRequest || '').slice(0, 2000) });
           }
           catch (err) { result = 'Action failed: ' + String(err.message || err).slice(0, 300); }
@@ -1132,7 +1199,7 @@ ipcMain.handle('ai:chat', async (e, { id, model, messages, think }) => {
           (announces || asksPermission) && !task.denied &&
           !/\b(all done|finished|completed|that's it|is done|are done|here you go)\b/i.test(tail)) {
         nudges++;
-        conversation.push({ role: 'assistant', content });
+        conversation.push({ role: 'assistant', content, ...(lastRaw ? { _raw: lastRaw } : {}) });
         conversation.push({ role: 'user', content: taskMode
           ? '[Bloop system note: do not ask or describe. The user already asked for this whole task, so continue it yourself: call the next tool now. Reply in words only when the goal is complete or you are truly blocked.]'
           : '[Bloop system note: the task is not finished. Do not describe the next step; call the tool for it now. Reply normally only once every step is done.]' });
@@ -1146,17 +1213,19 @@ ipcMain.handle('ai:chat', async (e, { id, model, messages, think }) => {
       break;
       } catch (err) {
         // Ollama sometimes rejects a malformed tool call from a small model. Sampling varies, so retry.
-        if (!ctrl.signal.aborted && noThink && /think/i.test(String((err && err.message) || err))) { noThink = false; continue; }
+        if (!ctrl.signal.aborted && !cloud && noThink && /think/i.test(String((err && err.message) || err))) { noThink = false; continue; }
+        if (err instanceof providers.ProviderError) throw err;
         if (!ctrl.signal.aborted && parseRetries < 2 && /parsing tool call|tool call|invalid character|unexpected end of JSON/i.test(String((err && err.message) || err))) { parseRetries++; continue; }
         throw err;
       }
     }
     if (total === 0 && !ctrl.signal.aborted) sendToken('(The model sent back an empty reply, even after a retry. Try asking again, or pick a different model with /model. Small or "thinking" models do this sometimes. /selftest shows what this model supports.)');
-    return { ok: true, truncated };
+    return { ok: true, truncated, tokens: sentTokens };
   } catch (err) {
     const stalled = ctrl.signal.aborted && ctrl.signal.reason === 'stalled';
-    return { ok: false, aborted: err.name === 'AbortError' && !stalled,
+    return { ok: false, aborted: ctrl.signal.aborted && !stalled, provider: pid, cloud, tokens: sentTokens,
       error: stalled ? 'The model stopped responding (it may still be loading, so try again in a moment).'
+        : err instanceof providers.ProviderError ? err.message
         : (/fetch failed|ECONNREFUSED|ECONNRESET/i.test(String(err.message || '') + String((err.cause && (err.cause.code || err.cause.message)) || ''))
           ? 'I cannot reach Ollama. Make sure it is running (it may have crashed or run out of memory), then try again.'
           : (String(err.message || (err.cause && err.cause.message) || err.name || '') || 'Ollama returned an error with no details. It may have run out of memory; try a smaller model.')) };
@@ -1168,7 +1237,7 @@ ipcMain.handle('ai:pull', async (e, { name }) => {
   const sender = e.sender;
   if (!/^[\w.\-:/]{1,100}$/.test(name || '')) return { ok: false, error: 'That does not look like a model name.' };
   try {
-    const res = await fetch(OLLAMA + '/api/pull', {
+    const res = await fetch(providers.ollamaBase() + '/api/pull', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, stream: true }),
@@ -1203,6 +1272,7 @@ ipcMain.handle('ai:pull', async (e, { name }) => {
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.whenReady().then(() => {
+  if (!PRIMARY) return; // a second copy is already on its way out
   if (process.platform === 'darwin') { try { app.dock.hide(); } catch { /* ignore */ } }
   // quiet daily check; the pet mentions it once per new version (Settings > Check for updates daily)
   const dailyCheck = async () => {
