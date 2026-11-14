@@ -25,7 +25,8 @@
       <section id="settings" class="hidden"><div id="settings-body"></div></section>
       <div id="messages"></div>
       <form id="chat-form" autocomplete="off">
-        <textarea id="chat-input" rows="1" placeholder="Type a message or /help  (Shift+Enter for a new line)" maxlength="8000"></textarea>
+        <div id="cmd-pop" class="hidden"></div>
+        <textarea id="chat-input" rows="1" placeholder="Message, or / for commands" title="Enter sends · Shift+Enter adds a line · Up arrow recalls · / lists commands" maxlength="8000"></textarea>
         <button id="send" type="submit" title="Send">↑</button>
       </form>
     </section>
@@ -58,6 +59,7 @@
     </div>
 
   </div>
+  <script src="md.js"></script>
   <script src="fx.js"></script>
   <script src="smooth.js"></script>
   <script src="cat.js"></script>

@@ -326,6 +326,7 @@ module.exports = function createControl(deps) {
 
   // -------------------------------------------------------------- screenshot
   async function visionOk(model) {
+    if (deps.modelCaps) { try { return (await deps.modelCaps(model)).vision !== false; } catch { return true; } }
     try {
       const r = await fetch(ollamaUrl + '/api/show', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model }), signal: AbortSignal.timeout(4000) });
       if (!r.ok) return true;

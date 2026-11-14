@@ -116,7 +116,11 @@
       },
       A: () => '#5a4636',
     },
+    // "custom": markings you painted yourself (Settings > Paint your own pattern). The cells live in
+    // look.paint as { "col,row": "A" | "B" } and the two colours in look.paintA / look.paintB.
+    custom: { fn: () => null },
   };
+  const PAINT_A = '#e8923a', PAINT_B = '#3a3a3e';
 
   // ---- custom colours: derive a whole palette from one hex
   const HEX = /^#[0-9a-f]{6}$/i;
@@ -194,9 +198,11 @@
     const key = custom ? 'custom' : furName;
     const pat = PATTERNS[look.pattern] || PATTERNS.solid;
     const f = Object.assign({}, col, pat.base || {});
+    const own = look.pattern === 'custom';
     return {
       ink: '#111111', fur: f.fur, furL: f.furL, ear: f.ear,
-      pA: pat.A ? pat.A(key, col) : f.stripe, pB: pat.B ? pat.B(key, col) : f.stripe,
+      pA: own ? (HEX.test(look.paintA || '') ? look.paintA : PAINT_A) : pat.A ? pat.A(key, col) : f.stripe,
+      pB: own ? (HEX.test(look.paintB || '') ? look.paintB : PAINT_B) : pat.B ? pat.B(key, col) : f.stripe,
       halo: '#ffffff', screen: '#050505', lit,
     };
   }
@@ -204,14 +210,19 @@
   function cssVars(look) {
     let v;
     if (SMOOTH.isSmooth(look.style)) {
-      const px = varsFor({ style: 'cat', fur: look.fur, pattern: look.pattern, furColor: look.furColor });
+      const px = varsFor({ style: 'cat', fur: look.fur, pattern: look.pattern, furColor: look.furColor, paintA: look.paintA, paintB: look.paintB });
       v = Object.assign(SMOOTH.paletteFor(look.style, look, px), { lit: '#ffffff' });
     } else v = varsFor(look);
     return '#pet{' + Object.keys(v).map((k) => `--${k}:${v[k]}`).join(';') + '}';
   }
 
   function markupCat(look) {
-    const pat = look.style === 'mono' ? PATTERNS.solid : (PATTERNS[look.pattern] || PATTERNS.solid);
+    // painted markings: looked up cell by cell. The wagging tail's second frame sits one column over.
+    const own = look.pattern === 'custom' && look.paint && typeof look.paint === 'object' ? look.paint : null;
+    const mark = (v) => (v === 'A' || v === 'B' ? v : null);
+    const pat = look.style === 'mono' ? PATTERNS.solid
+      : own ? { all: true, fn: (c, r, g) => mark(own[key(c, r)]) || (g === 'tail' && c === 22 ? mark(own[key(21, r)]) : null) }
+        : (PATTERNS[look.pattern] || PATTERNS.solid);
     const base = groupFromRows(BASE_ROWS, 0, 0);
     const pawL = groupFromRows(PAW_ROWS, 5, 20);
     const pawR = groupFromRows(PAW_ROWS, 13, 20);
@@ -224,7 +235,7 @@
 
     const paint = (g, name) => {
       const A = [], B = [];
-      g.F.forEach(([c, r]) => {
+      (pat.all ? g.F.concat(g.L) : g.F).forEach(([c, r]) => {
         const v = pat.fn(c, r, name);
         if (v === 'A') A.push([c, r]); else if (v === 'B') B.push([c, r]);
       });
@@ -410,10 +421,34 @@
     st.textContent = cssVars(Object.assign({}, look, { style }));
   }
 
+  // For the pattern painter: every cell of the pixel cat (t: K outline, F fur, L light fur, P inner ear)
+  // and which part it belongs to. F and L cells can be painted.
+  function paintCells() {
+    const map = new Map();
+    const add = (g, name) => ['K', 'F', 'L', 'P'].forEach((t) => g[t].forEach(([c, r]) => map.set(key(c, r), { c, r, t, g: name })));
+    add(tailGroup(TAIL_A), 'tail');
+    add(groupFromRows(BASE_ROWS, 0, 0), 'base');
+    add(groupFromRows(PAW_ROWS, 5, 20), 'paw');
+    add(groupFromRows(PAW_ROWS, 13, 20), 'paw');
+    return { cells: [...map.values()], eyes: EYES, nose: NOSE, mouth: SMILE };
+  }
+  // A built-in pattern as painted cells, so you can start from tabby or calico and change it.
+  function presetPaint(name) {
+    const pat = PATTERNS[name];
+    const out = {};
+    if (!pat || name === 'custom') return out;
+    paintCells().cells.forEach(({ c, r, t, g }) => {
+      if (t !== 'F') return;
+      const v = pat.fn(c, r, g);
+      if (v === 'A' || v === 'B') out[key(c, r)] = v;
+    });
+    return out;
+  }
+
   const LOOK_LABELS = Object.assign({ cat: 'Cat', mono: 'Mono cat', eyes: 'OLED eyes' }, SMOOTH.LABELS);
   const api = {
     build, markup, varsFor, HEX, derive, cssVars, FUR, PATTERNS, FUR_NAMES, PATTERN_NAMES, STYLES, BASE_LEFT,
-    renderOf, renderChoices, RENDERS,
+    renderOf, renderChoices, RENDERS, paintCells, presetPaint, PAINT_A, PAINT_B,
     PIXEL_STYLES, SMOOTH_STYLES: SMOOTH.NAMES, LOOK_LABELS, isSmooth: SMOOTH.isSmooth,
     ACC_NAMES: FX.ACC_NAMES, PROP_NAMES: FX.PROP_NAMES, SPECIES: SMOOTH.SPECIES,
   };

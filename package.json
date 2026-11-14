@@ -1,10 +1,12 @@
 {
   "name": "bloop-desktop-pet",
-  "version": "3.10.3",
-  "description": "Bloop desktop pet with local AI, web search, isolated browser automation, permissioned computer control, and safety boundaries",
+  "version": "3.11.0",
+  "description": "Bloop desktop pet with local or cloud AI, web search, isolated browser automation, permissioned computer control, and safety boundaries",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --test",
+    "check": "node scripts/check.js",
     "dist": "electron-builder",
     "dist:win": "electron-builder --win",
     "dist:mac": "electron-builder --mac",
@@ -16,8 +18,8 @@
     "electron-builder": "^25.1.8"
   },
   "optionalDependencies": {
-    "uiohook-napi": "^1.5.5",
-    "electron-updater": "^6.3.9"
+    "electron-updater": "^6.3.9",
+    "uiohook-napi": "^1.5.5"
   },
   "author": "Exzemie",
   "keywords": [
@@ -40,6 +42,8 @@
       "**/*",
       "!.github/**",
       "!dist/**",
+      "!test/**",
+      "!scripts/**",
       "!*.vbs"
     ],
     "win": {
@@ -82,5 +86,8 @@
   "homepage": "https://github.com/Exzemie/bloop-desktop-pet#readme",
   "bugs": {
     "url": "https://github.com/Exzemie/bloop-desktop-pet/issues"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.8.0"
   }
 }
