@@ -6,7 +6,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with: { node-version: 20, cache: npm }
+      # --ignore-scripts skips the Electron download: the checks and tests only need the plain Node packages
+      - name: Install packages
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Syntax-check every script and smoke-test the renderers
         run: npm run check
       - name: Unit tests
